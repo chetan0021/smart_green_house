@@ -20,6 +20,15 @@ GAP_THRESHOLD        = 0.05
 
 app = Flask(__name__)
 
+
+@app.after_request
+def add_cross_origin_headers(response):
+    """Allow the Vercel dashboard to submit leaf images to this API."""
+    response.headers["Access-Control-Allow-Origin"] = os.getenv("CORS_ORIGIN", "*")
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    return response
+
 UPLOAD_FOLDER = "uploads"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
@@ -614,6 +623,11 @@ UPLOAD_HTML = """
 """
 
 # ─── ROUTES ───────────────────────────────────────────────────────────────────
+@app.route("/health")
+def health():
+    return jsonify({"ok": True, "service": "smart-greenhouse-disease-api"})
+
+
 @app.route("/")
 def home():
     return render_template("dashboard.html")
