@@ -16,7 +16,7 @@ const char* WIFI_SSID = "YOUR_FIXED_WIFI_NAME";
 const char* WIFI_PASSWORD = "YOUR_FIXED_WIFI_PASSWORD";
 // Local example: http://192.168.1.4:5000
 // Cloud example: https://YOUR_PROJECT_REF.supabase.co/functions/v1/greenhouse-ingest
-const char* SERVER_URL = "https://YOUR_PROJECT_REF.supabase.co/functions/v1/greenhouse-ingest";
+const char* SERVER_URL = "https://wclsupskijbczcwocmze.supabase.co/functions/v1/greenhouse-ingest";
 // Set the same secret as DEVICE_INGEST_KEY in Supabase Edge Function Secrets.
 // Do not use or expose this key in the Vercel frontend.
 const char* DEVICE_INGEST_KEY = "REPLACE_WITH_A_LONG_RANDOM_SECRET";
