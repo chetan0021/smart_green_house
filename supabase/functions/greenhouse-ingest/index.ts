@@ -16,7 +16,10 @@ const json = (body: unknown, status = 200) =>
 
 Deno.serve(async (request) => {
   if (request.method === "OPTIONS") return new Response("ok", { headers: corsHeaders });
-  if (request.headers.get("x-device-key") !== Deno.env.get("DEVICE_INGEST_KEY")) {
+  // DEVICE_INGEST_KEY is optional for initial hardware testing. Once it is set
+  // in Edge Function Secrets, every request must provide the matching header.
+  const deviceIngestKey = Deno.env.get("DEVICE_INGEST_KEY");
+  if (deviceIngestKey && request.headers.get("x-device-key") !== deviceIngestKey) {
     return json({ error: "Unauthorized device" }, 401);
   }
 

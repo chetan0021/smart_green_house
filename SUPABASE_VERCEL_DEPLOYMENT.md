@@ -31,15 +31,14 @@ supabase link --project-ref YOUR_PROJECT_REF
 
 `YOUR_PROJECT_REF` is the identifier in your Supabase URL, for example `abcdxyz` from `https://abcdxyz.supabase.co`.
 
-Create a local `supabase/functions/.env` from the example file. Set a long random `DEVICE_INGEST_KEY` and your Supabase secret/service-role key as `SERVICE_ROLE_KEY`.
+Create a local `supabase/functions/.env` from the example file. For temporary testing, set only your Supabase secret/service-role key as `SERVICE_ROLE_KEY`. `DEVICE_INGEST_KEY` is optional: adding it later requires the matching value from the ESP32.
 
 ```powershell
-supabase secrets set DEVICE_INGEST_KEY="your-long-random-device-secret"
 supabase secrets set SERVICE_ROLE_KEY="your-supabase-secret-service-role-key"
 supabase functions deploy greenhouse-ingest --no-verify-jwt
 ```
 
-The `--no-verify-jwt` flag is intentional: ESP32 does not use a Supabase user JWT. The function validates `X-Device-Key` against the private `DEVICE_INGEST_KEY` instead.
+The `--no-verify-jwt` flag is intentional: ESP32 does not use a Supabase user JWT. While testing with no `DEVICE_INGEST_KEY`, the endpoint is open and should not be used for a real deployment. Later, set `DEVICE_INGEST_KEY` in Edge Function Secrets and the function will validate `X-Device-Key` automatically.
 
 Your final ESP32 URL is:
 
@@ -55,7 +54,7 @@ Open `esp32/SmartGreenhouse.ino` and set:
 const char* WIFI_SSID = "your-wifi-name";
 const char* WIFI_PASSWORD = "your-wifi-password";
 const char* SERVER_URL = "https://YOUR_PROJECT_REF.supabase.co/functions/v1/greenhouse-ingest";
-const char* DEVICE_INGEST_KEY = "exactly-the-same-secret-set-in-supabase";
+const char* DEVICE_INGEST_KEY = ""; // Set later to enable device authentication.
 ```
 
 The soil sensor input is now **GPIO 36**. First run `esp32/tests/SoilMoisture_Calibration/SoilMoisture_Calibration.ino` and copy your dry/wet raw values into the final sketch. Then upload the final sketch. Serial Monitor at `115200` should show `Telemetry status: 200`.

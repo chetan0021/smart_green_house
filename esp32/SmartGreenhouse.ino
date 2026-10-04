@@ -17,9 +17,9 @@ const char* WIFI_PASSWORD = "YOUR_FIXED_WIFI_PASSWORD";
 // Local example: http://192.168.1.4:5000
 // Cloud example: https://YOUR_PROJECT_REF.supabase.co/functions/v1/greenhouse-ingest
 const char* SERVER_URL = "https://wclsupskijbczcwocmze.supabase.co/functions/v1/greenhouse-ingest";
-// Set the same secret as DEVICE_INGEST_KEY in Supabase Edge Function Secrets.
-// Do not use or expose this key in the Vercel frontend.
-const char* DEVICE_INGEST_KEY = "REPLACE_WITH_A_LONG_RANDOM_SECRET";
+// Leave empty while testing. Later set the same value as DEVICE_INGEST_KEY in
+// Supabase Edge Function Secrets; never expose it in the Vercel frontend.
+const char* DEVICE_INGEST_KEY = "";
 const char* DEVICE_ID = "greenhouse-esp32-s3-01";
 
 // ---------- Wiring: change to match your actual ESP32-S3 board ----------
@@ -137,7 +137,7 @@ void fetchConfig() {
   if (WiFi.status() != WL_CONNECTED) return;
   HTTPClient http;
   http.begin(String(SERVER_URL) + "?action=config&deviceId=" + DEVICE_ID);
-  http.addHeader("X-Device-Key", DEVICE_INGEST_KEY);
+  if (strlen(DEVICE_INGEST_KEY) > 0) http.addHeader("X-Device-Key", DEVICE_INGEST_KEY);
   int status = http.GET();
   if (status == HTTP_CODE_OK) {
     StaticJsonDocument<768> doc;
@@ -179,7 +179,7 @@ void sendTelemetry(float temperature, float humidity, float soil, float light, f
   HTTPClient http;
   http.begin(SERVER_URL);
   http.addHeader("Content-Type", "application/json");
-  http.addHeader("X-Device-Key", DEVICE_INGEST_KEY);
+  if (strlen(DEVICE_INGEST_KEY) > 0) http.addHeader("X-Device-Key", DEVICE_INGEST_KEY);
   int status = http.POST(body);
   Serial.printf("Telemetry status: %d\n", status);
   http.end();
