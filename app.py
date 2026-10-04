@@ -1,10 +1,16 @@
-from flask import Flask, request, jsonify, render_template_string, send_file
+from flask import Flask, request, jsonify, render_template, send_file
 import numpy as np
 import cv2
-import tensorflow as tf
+import onnxruntime as ort
 from PIL import Image
 import json
 import os
+import base64
+from collections import deque
+from datetime import datetime, timezone
+from threading import Thread, Lock
+import smtplib
+from email.message import EmailMessage
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
 IMG_SIZE             = 224
@@ -17,76 +23,189 @@ app = Flask(__name__)
 UPLOAD_FOLDER = "uploads"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
-# ─── LOAD MODELS ──────────────────────────────────────────────────────────────
-print("Loading disease model...")
-disease_model = tf.keras.models.load_model("plant_disease_model.h5")
+# ─── GREENHOUSE TELEMETRY + CONTROL ──────────────────────────────────────────
+# ESP32 posts a JSON snapshot to /api/telemetry every 10 seconds. Data is kept
+# in memory for this local dashboard; replace these stores with Supabase later
+# when you need permanent multi-device cloud history.
+telemetry_lock = Lock()
+telemetry_history = deque(maxlen=720)  # two hours at one reading every 10 s
+latest_telemetry = None
+last_alert_at = {}
+control_config = {
+    "temperatureOn": 35.0,
+    "temperatureOff": 32.0,
+    "soilMoistureOn": 30.0,
+    "soilMoistureOff": 45.0,
+    "irrigationBurstSeconds": 10,
+    "irrigationSoakSeconds": 30,
+    "lightStartHour": 6,
+    "lightEndHour": 18,
+    "modes": {"pump": "auto", "fan": "auto", "growLight": "auto"},
+    "manual": {"pump": False, "fan": False, "growLight": False},
+}
+ALERT_COOLDOWN_SECONDS = 20 * 60
+condition_started_at = {}
 
-print("Loading leaf detector...")
-leaf_detector_model = tf.keras.models.load_model("leaf_detector.h5")
+# ─── LOAD THE STRONGER LOCAL CLASSIFIER ──────────────────────────────────────
+# CropGuard is a ResNet-50 trained and evaluated with a leaf-grouped split.
+# It replaces the repository's two-stage filter, which was rejecting valid leaves.
+print("Loading CropGuard disease model...")
+cropguard_model = ort.InferenceSession("cropguard.onnx", providers=["CPUExecutionProvider"])
+with open("cropguard_classes.json", encoding="utf-8") as class_file:
+    cropguard_classes = json.load(class_file)
+with open("cropguard_calibration.json", encoding="utf-8") as calibration_file:
+    CROP_GUARD_TEMPERATURE = float(json.load(calibration_file)["temperature"])
+print("CropGuard model loaded")
 
-print("Loading class labels...")
-class_indices = json.load(open("class_indices.json"))
-class_indices = {int(k): v for k, v in class_indices.items()}
 
-print("Loading leaf detector config...")
-leaf_config   = json.load(open("leaf_detector_config.json"))
-LEAF_CLASS    = leaf_config["leaf_class_index"]
+def cropguard_preprocess(image):
+    """Match CropGuard's published resize-short-side, centre-crop preprocessing."""
+    rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    height, width = rgb.shape[:2]
+    scale = 256.0 / min(height, width)
+    resized = cv2.resize(rgb, (round(width * scale), round(height * scale)), interpolation=cv2.INTER_CUBIC)
+    top = (resized.shape[0] - 224) // 2
+    left = (resized.shape[1] - 224) // 2
+    crop = resized[top:top + 224, left:left + 224].astype(np.float32) / 255.0
+    crop = (crop - np.array([0.485, 0.456, 0.406], dtype=np.float32)) / np.array([0.229, 0.224, 0.225], dtype=np.float32)
+    return np.ascontiguousarray(crop.transpose(2, 0, 1)[None, ...], dtype=np.float32)
 
-print("✅ All models loaded")
 
-# ─── LEAF DETECTOR ────────────────────────────────────────────────────────────
-def is_leaf(image):
-    img  = cv2.resize(image, (LEAF_IMG_SIZE, LEAF_IMG_SIZE))
-    img  = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    img  = img / 255.0
-    img  = np.expand_dims(img, axis=0)
-
-    prob = leaf_detector_model.predict(img, verbose=0)[0][0]
-
-    if LEAF_CLASS == 1:
-        detected = prob > 0.5
-        conf     = float(prob)
-    else:
-        detected = prob < 0.5
-        conf     = float(1 - prob)
-
-    print(f"Leaf detector: {conf:.3f} → {'LEAF' if detected else 'NOT LEAF'}")
-    return detected
-
-# ─── DISEASE CLASSIFIER ───────────────────────────────────────────────────────
 def predict_disease(image):
-    img  = cv2.resize(image, (IMG_SIZE, IMG_SIZE))
-    img  = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    img  = img / 255.0
-    img  = np.expand_dims(img, axis=0)
+    logits = cropguard_model.run(["logits"], {"input": cropguard_preprocess(image)})[0][0]
+    calibrated_logits = logits / CROP_GUARD_TEMPERATURE
+    probabilities = np.exp(calibrated_logits - np.max(calibrated_logits))
+    probabilities /= probabilities.sum()
+    class_id = int(np.argmax(probabilities))
+    confidence = float(probabilities[class_id])
 
-    preds        = disease_model.predict(img, verbose=0)[0]
-    sorted_probs = np.sort(preds)
-    top1         = sorted_probs[-1]
-    top2         = sorted_probs[-2]
-    class_id     = np.argmax(preds)
-    gap          = top1 - top2
-
-    print(f"Disease model: top1={top1:.3f} gap={gap:.3f}")
-
-    if top1 < CONFIDENCE_THRESHOLD or gap < GAP_THRESHOLD:
-        return "Plant not present in DB", float(top1)
-
-    return class_indices[class_id], float(top1)
+    # Unlike the source app, no unreliable leaf-detector gate blocks a valid
+    # disease prediction. A low-confidence photo is reported as uncertain.
+    if confidence < 0.55:
+        return "Uncertain - use a close, well-lit photo of one supported leaf", confidence
+    return cropguard_classes[class_id], confidence
 
 # ─── MAIN PIPELINE ────────────────────────────────────────────────────────────
 def plant_pipeline(image):
     try:
-        # Step 1 — check if leaf is present
-        if not is_leaf(image):
-            return "No leaf detected", 0.0
-
-        # Step 2 — classify disease
         return predict_disease(image)
 
     except Exception as e:
         print(f"Pipeline error: {e}")
         return "Processing error", 0.0
+
+
+def annotated_image_data_url(image, prediction, confidence):
+    """Return an image with the classified leaf clearly marked for the web UI.
+
+    This repository's supplied model is a whole-leaf classifier rather than a
+    lesion-segmentation model, so the overlay deliberately marks the analysed
+    leaf image (not a made-up diseased-spot location).
+    """
+    annotated = image.copy()
+    height, width = annotated.shape[:2]
+    inset = max(8, min(width, height) // 35)
+    healthy = "healthy" in prediction.lower()
+    color = (80, 220, 80) if healthy else (60, 70, 245)
+    cv2.rectangle(annotated, (inset, inset), (width - inset, height - inset), color, max(3, inset // 3))
+
+    label = f"{prediction.replace('___', ' - ').replace('__', ' - ')}  |  {confidence * 100:.1f}%"
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    scale = max(0.45, min(0.9, width / 1000))
+    thickness = max(1, int(scale * 2))
+    (label_width, label_height), _ = cv2.getTextSize(label, font, scale, thickness)
+    banner_height = label_height + 28
+    cv2.rectangle(annotated, (0, 0), (width, banner_height), (12, 24, 18), -1)
+    cv2.putText(annotated, label, (12, label_height + 12), font, scale, color, thickness, cv2.LINE_AA)
+
+    ok, buffer = cv2.imencode(".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, 92])
+    if not ok:
+        return None
+    return "data:image/jpeg;base64," + base64.b64encode(buffer).decode("ascii")
+
+
+def utc_now():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def normalise_telemetry(payload):
+    """Validate the compact ESP32 JSON payload before it reaches the dashboard."""
+    required = ("temperature", "humidity", "soilMoisture", "light")
+    missing = [key for key in required if key not in payload]
+    if missing:
+        raise ValueError("Missing telemetry fields: " + ", ".join(missing))
+    reading = {
+        "timestamp": utc_now(),
+        "deviceId": str(payload.get("deviceId", "esp32-s3-greenhouse")),
+        "temperature": round(float(payload["temperature"]), 1),
+        "humidity": round(float(payload["humidity"]), 1),
+        "soilMoisture": round(float(payload["soilMoisture"]), 1),
+        "light": round(float(payload["light"]), 1),
+        "pump": bool(payload.get("pump", False)),
+        "fan": bool(payload.get("fan", False)),
+        "growLight": bool(payload.get("growLight", False)),
+        "wifiRssi": int(payload.get("wifiRssi", 0)),
+        # 0 means no voltage-divider sensor is fitted yet; do not treat it as low battery.
+        "batteryVoltage": round(float(payload.get("batteryVoltage", 0)), 2),
+    }
+    if not (-20 <= reading["temperature"] <= 70 and 0 <= reading["humidity"] <= 100 and
+            0 <= reading["soilMoisture"] <= 100 and 0 <= reading["light"] <= 100 and 0 <= reading["batteryVoltage"] <= 20):
+        raise ValueError("One or more sensor values are outside a valid range")
+    return reading
+
+
+def alert_reasons(reading):
+    reasons = []
+    now = datetime.now(timezone.utc).timestamp()
+    if reading["temperature"] > 38:
+        started = condition_started_at.setdefault("critical-temperature", now)
+        if now - started >= 5 * 60:
+            reasons.append(f"Temperature has exceeded 38 C for five minutes: {reading['temperature']} C. Fan reported {'ON' if reading['fan'] else 'OFF'}.")
+    else:
+        condition_started_at.pop("critical-temperature", None)
+    if reading["soilMoisture"] < 20 and reading["pump"]:
+        reasons.append(f"Soil moisture remains critically low at {reading['soilMoisture']}% despite pump activation. Check the reservoir and irrigation line.")
+    if 0 < reading["batteryVoltage"] < 3.3:
+        reasons.append(f"Battery voltage is {reading['batteryVoltage']} V. Switch to auxiliary or grid power.")
+    return reasons
+
+
+def send_email_alert_async(reading, reasons):
+    """Email only when SMTP settings are configured; never block an ESP32 post."""
+    host = os.getenv("SMTP_HOST")
+    recipient = os.getenv("ALERT_TO_EMAIL")
+    if not host or not recipient:
+        return
+
+    def deliver():
+        try:
+            message = EmailMessage()
+            message["Subject"] = "Smart Greenhouse alert"
+            message["From"] = os.getenv("SMTP_FROM", os.getenv("SMTP_USER", "greenhouse@localhost"))
+            message["To"] = recipient
+            message.set_content("\n".join(reasons) + "\n\nLive reading:\n" + json.dumps(reading, indent=2))
+            with smtplib.SMTP(host, int(os.getenv("SMTP_PORT", "587")), timeout=15) as smtp:
+                if os.getenv("SMTP_TLS", "true").lower() == "true":
+                    smtp.starttls()
+                if os.getenv("SMTP_USER"):
+                    smtp.login(os.environ["SMTP_USER"], os.environ.get("SMTP_PASSWORD", ""))
+                smtp.send_message(message)
+        except Exception as error:
+            app.logger.warning("Alert email failed: %s", error)
+
+    Thread(target=deliver, daemon=True).start()
+
+
+def maybe_send_alert(reading):
+    now = datetime.now(timezone.utc).timestamp()
+    reasons = alert_reasons(reading)
+    if not reasons:
+        return
+    key = "|".join(reasons)
+    if now - last_alert_at.get(key, 0) < ALERT_COOLDOWN_SECONDS:
+        return
+    last_alert_at[key] = now
+    send_email_alert_async(reading, reasons)
 
 # ─── DECODE IMAGE ─────────────────────────────────────────────────────────────
 def decode_image(req):
@@ -371,30 +490,24 @@ UPLOAD_HTML = """
       </div>
     </div>
 
-    <!-- ESP32 Card -->
+    <!-- Browser camera card -->
     <div class="card">
-      <div class="section-label">Live Feed</div>
-      <div class="card-title">ESP32-CAM Stream</div>
-      <div class="card-subtitle">Auto-refreshes every 15 seconds</div>
+      <div class="section-label">Camera Analysis</div>
+      <div class="card-title">Use Your Webcam</div>
+      <div class="card-subtitle">Capture a leaf photo directly from this browser</div>
       <div class="feed-frame" id="feed-frame">
-        <img id="espimg" src="/latest.jpg" alt="ESP32 Feed"
-             onerror="handleFeedError(this)">
-        <div class="feed-overlay">
-          <div class="live-dot"></div> LIVE
-        </div>
+        <video id="camera-video" autoplay playsinline muted style="width:100%;height:100%;object-fit:cover"></video>
       </div>
-      <div class="result-box has-result" id="esp-result">
-        <div class="r-label">Waiting for device</div>
-        <div class="r-name">—</div>
-      </div>
-      <div class="timestamp" id="esp-timestamp">No frames received yet</div>
+      <button type="button" class="btn" id="camera-btn"><span class="btn-icon">📸</span> Capture & Analyze</button>
+      <div class="result-box" id="camera-result"><span style="opacity:0.4">Allow camera access, then capture a leaf</span></div>
+      <div class="timestamp" id="camera-status">Requesting camera access…</div>
     </div>
 
   </div>
 
   <footer>
-    <div>PhytoScan · ESP32 + MobileNetV2 + TensorFlow</div>
-    <div>Smart Plant Health Monitoring</div>
+    <div>PhytoScan · CropGuard ResNet-50 + ONNX Runtime</div>
+    <div>38 conditions across 14 supported crops</div>
   </footer>
 
 </div>
@@ -424,6 +537,7 @@ UPLOAD_HTML = """
       const res  = await fetch('/upload_json', { method:'POST', body:formData });
       const data = await res.json();
       showResult('upload-result', data.prediction, data.confidence);
+      showAnnotatedImage(data.annotated_image);
     } catch(err) {
       showResult('upload-result', 'Error processing image', 0);
     } finally {
@@ -453,38 +567,47 @@ UPLOAD_HTML = """
     }, 50);
   }
 
-  function handleFeedError(img) {
-    img.style.display = 'none';
-    const frame = document.getElementById('feed-frame');
-    if (!frame.querySelector('.no-feed-msg')) {
-      const msg = document.createElement('div');
-      msg.className = 'no-feed-msg';
-      msg.innerHTML = '<span class="icon">📡</span>Waiting for ESP32<br><small>Connect device to start</small>';
-      frame.appendChild(msg);
+  function showAnnotatedImage(dataUrl) {
+    if (!dataUrl) return;
+    previewImg.src = dataUrl;
+    previewWrap.style.display = 'block';
+  }
+
+  const cameraVideo = document.getElementById('camera-video');
+  const cameraStatus = document.getElementById('camera-status');
+  navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' } }, audio: false })
+    .then(stream => {
+      cameraVideo.srcObject = stream;
+      cameraStatus.textContent = 'Camera ready — keep one leaf in clear light';
+    })
+    .catch(() => {
+      cameraStatus.textContent = 'Camera unavailable — use image upload instead';
+      document.getElementById('camera-btn').disabled = true;
+    });
+
+  document.getElementById('camera-btn').addEventListener('click', async () => {
+    if (!cameraVideo.videoWidth) return;
+    const button = document.getElementById('camera-btn');
+    button.classList.add('loading');
+    const canvas = document.createElement('canvas');
+    canvas.width = cameraVideo.videoWidth;
+    canvas.height = cameraVideo.videoHeight;
+    canvas.getContext('2d').drawImage(cameraVideo, 0, 0);
+    const imageBlob = await new Promise(resolve => canvas.toBlob(resolve, 'image/jpeg', 0.92));
+    const formData = new FormData();
+    formData.append('image', imageBlob, 'webcam-leaf.jpg');
+    try {
+      const res = await fetch('/upload_json', { method: 'POST', body: formData });
+      const data = await res.json();
+      showResult('camera-result', data.prediction, data.confidence);
+      showAnnotatedImage(data.annotated_image);
+      cameraStatus.textContent = 'Analysis completed: ' + new Date().toLocaleTimeString();
+    } catch (_) {
+      showResult('camera-result', 'Error processing image', 0);
+    } finally {
+      button.classList.remove('loading');
     }
-  }
-
-  function pollESP() {
-    const img = document.getElementById('espimg');
-    img.src = '/latest.jpg?t=' + Date.now();
-    img.style.display = 'block';
-    const noFeed = document.querySelector('.no-feed-msg');
-    if (noFeed) noFeed.remove();
-
-    fetch('/latest_result')
-      .then(r => r.json())
-      .then(data => {
-        if (!data.prediction) return;
-        showResult('esp-result', data.prediction, data.confidence);
-        document.getElementById('esp-result')
-                .querySelector('.r-label').textContent = 'Live Diagnosis';
-        document.getElementById('esp-timestamp').textContent =
-          'Last updated: ' + new Date().toLocaleTimeString();
-      })
-      .catch(() => {});
-  }
-
-  setInterval(pollESP, 15000);
+  });
 </script>
 </body>
 </html>
@@ -493,7 +616,63 @@ UPLOAD_HTML = """
 # ─── ROUTES ───────────────────────────────────────────────────────────────────
 @app.route("/")
 def home():
-    return render_template_string(UPLOAD_HTML)
+    return render_template("dashboard.html")
+
+
+@app.route("/api/telemetry", methods=["POST"])
+def receive_telemetry():
+    """ESP32-S3 endpoint. Send Content-Type: application/json."""
+    global latest_telemetry
+    try:
+        payload = request.get_json(force=True)
+        if not isinstance(payload, dict):
+            raise ValueError("Telemetry must be a JSON object")
+        reading = normalise_telemetry(payload)
+        with telemetry_lock:
+            latest_telemetry = reading
+            telemetry_history.append(reading)
+        maybe_send_alert(reading)
+        return jsonify({"ok": True, "config": control_config})
+    except (TypeError, ValueError) as error:
+        return jsonify({"ok": False, "error": str(error)}), 400
+
+
+@app.route("/api/telemetry", methods=["GET"])
+def get_telemetry():
+    with telemetry_lock:
+        return jsonify({
+            "latest": latest_telemetry,
+            "history": list(telemetry_history),
+            "connected": latest_telemetry is not None,
+        })
+
+
+@app.route("/api/config", methods=["GET", "PUT"])
+def greenhouse_config():
+    if request.method == "GET":
+        return jsonify(control_config)
+    try:
+        payload = request.get_json(force=True)
+        for key in ("temperatureOn", "temperatureOff", "soilMoistureOn", "soilMoistureOff", "irrigationBurstSeconds", "irrigationSoakSeconds", "lightStartHour", "lightEndHour"):
+            if key in payload:
+                control_config[key] = float(payload[key])
+        if isinstance(payload.get("modes"), dict):
+            for actuator in control_config["modes"]:
+                if payload["modes"].get(actuator) in ("auto", "manual"):
+                    control_config["modes"][actuator] = payload["modes"][actuator]
+        if isinstance(payload.get("manual"), dict):
+            for actuator in control_config["manual"]:
+                if actuator in payload["manual"]:
+                    control_config["manual"][actuator] = bool(payload["manual"][actuator])
+        if control_config["temperatureOff"] >= control_config["temperatureOn"]:
+            raise ValueError("Fan off threshold must be lower than fan on threshold")
+        if not (1 <= control_config["irrigationBurstSeconds"] <= 60 and 1 <= control_config["irrigationSoakSeconds"] <= 300):
+            raise ValueError("Irrigation durations must be between 1 and 60/300 seconds")
+        if not (0 <= control_config["lightStartHour"] <= 23 and 0 <= control_config["lightEndHour"] <= 23):
+            raise ValueError("Grow-light hours must be from 0 through 23")
+        return jsonify({"ok": True, "config": control_config})
+    except (TypeError, ValueError) as error:
+        return jsonify({"ok": False, "error": str(error)}), 400
 
 @app.route("/latest.jpg")
 def latest_image():
@@ -519,10 +698,19 @@ def upload_json():
         img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
 
         prediction, confidence = plant_pipeline(img)
+        annotated_image = annotated_image_data_url(img, prediction, confidence)
+        # Specification: email a confident disease finding. Healthy and uncertain
+        # classifications do not generate a biological-threat alert.
+        if confidence > 0.85 and "healthy" not in prediction.lower() and "uncertain" not in prediction.lower():
+            send_email_alert_async(
+                {"timestamp": utc_now(), "disease": prediction, "confidence": round(confidence, 3)},
+                [f"Disease detected: {prediction} ({confidence * 100:.1f}% confidence)."]
+            )
 
         return jsonify({
             "prediction": prediction,
-            "confidence": round(confidence, 3)
+            "confidence": round(confidence, 3),
+            "annotated_image": annotated_image
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
